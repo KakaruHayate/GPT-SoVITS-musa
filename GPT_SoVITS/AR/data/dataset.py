@@ -44,6 +44,8 @@ class Text2SemanticDataset(Dataset):
         self,
         phoneme_path: str,
         semantic_path: str,
+        ### NEW/MODIFIED ###
+        pair_semantic_path: str = None, # Path to the target style semantics
         max_sample: int = None,
         max_sec: int = 100,
         pad_val: int = 1024,
@@ -54,11 +56,31 @@ class Text2SemanticDataset(Dataset):
     ) -> None:
         super().__init__()
 
-        self.semantic_data = pd.read_csv(
+        ### NEW/MODIFIED ###
+        # semantic_data will be the PROMPT (Style A)
+        self.prompt_semantic_data = pd.read_csv(
             semantic_path,
             delimiter="\t",
             encoding="utf-8",
-        )
+            header=None, # Assuming no header
+        ).set_index(0) # Use the item_name as index for fast lookup
+
+        # Check if we are in style transfer mode
+        self.style_transfer_mode = pair_semantic_path is not None
+        if self.style_transfer_mode:
+            print("Dataset is in STYLE TRANSFER mode.")
+            # target_semantic_data will be the TARGET (Style B)
+            self.target_semantic_data = pd.read_csv(
+                pair_semantic_path,
+                delimiter="\t",
+                encoding="utf-8",
+                header=None, # Assuming no header
+            ).set_index(0) # Use the item_name as index
+        else:
+            print("Dataset is in normal (cloning) mode.")
+            # In normal mode, prompt and target are the same
+            self.target_semantic_data = self.prompt_semantic_data
+
         # get dict
         self.path2 = phoneme_path  # "%s/2-name2text.txt"%exp_dir#phoneme_path
         self.path3 = "%s/3-bert" % (
@@ -94,7 +116,8 @@ class Text2SemanticDataset(Dataset):
         self.max_ps_ratio = max_ps_ratio
 
         if max_sample is not None:
-            self.semantic_data = self.semantic_data[:max_sample]
+            # self.semantic_data = self.semantic_data[:max_sample]
+            self.prompt_semantic_data = self.prompt_semantic_data.iloc[:max_sample]
 
         # {idx: (semantic, phoneme)}
         # semantic list, phoneme list
@@ -107,12 +130,13 @@ class Text2SemanticDataset(Dataset):
             # 调用初始化函数
             self.init_batch()
             self.inited = True
-            del self.semantic_data
+            del self.prompt_semantic_data
+            del self.target_semantic_data
             del self.phoneme_data
         # self.tokenizer = AutoTokenizer.from_pretrained("hfl/chinese-roberta-wwm-ext-large")
         # self.tokenizer = AutoTokenizer.from_pretrained("/data/docker/liujing04/bert-vits2/Bert-VITS2-master20231106/bert/chinese-roberta-wwm-ext-large")
 
-    def init_batch(self):
+    def init_batch_old(self):
         semantic_data_len = len(self.semantic_data)
         phoneme_data_len = len(self.phoneme_data.keys())
         print("semantic_data_len:", semantic_data_len)
@@ -205,13 +229,90 @@ class Text2SemanticDataset(Dataset):
         # 345410 for LibriTTS
         print("dataset.__len__():", self.__len__())
 
+    def init_batch(self):
+        prompt_data_len = len(self.prompt_semantic_data)
+        phoneme_data_len = len(self.phoneme_data.keys())
+        print("prompt_semantic_data_len:", prompt_data_len)
+        print("phoneme_data_len:", phoneme_data_len)
+
+        idx = 0
+        num_not_in_phoneme = 0
+        num_not_in_target = 0
+        num_deleted_bigger = 0
+        num_deleted_ps = 0
+
+        # Iterate through the prompt data as the main loop
+        for item_name, prompt_row in self.prompt_semantic_data.iterrows():
+            # 1. Check for phoneme data
+            try:
+                phoneme, _, _ = self.phoneme_data[item_name]
+            except KeyError:
+                num_not_in_phoneme += 1
+                continue
+
+            # 2. Check for target semantic data
+            try:
+                target_row = self.target_semantic_data.loc[item_name]
+            except KeyError:
+                num_not_in_target += 1
+                continue
+
+            ### NEW/MODIFIED ###
+            # Get token lists for both prompt and target
+            prompt_semantic_str = prompt_row[1]
+            target_semantic_str = target_row[1]
+            prompt_semantic_ids = [int(i) for i in prompt_semantic_str.split(" ")]
+            target_semantic_ids = [int(i) for i in target_semantic_str.split(" ")]
+            
+            # Filter based on the TARGET length, as it's what we predict
+            if len(target_semantic_ids) > self.max_sec * self.hz:
+                num_deleted_bigger += 1
+                continue
+            
+            phoneme = phoneme.split(" ")
+            try:
+                phoneme_ids = cleaned_text_to_sequence(phoneme, version)
+            except Exception:
+                traceback.print_exc()
+                num_not_in_phoneme += 1
+                continue
+
+            if len(phoneme_ids) > self.max_sec * self.hz / 2.5:
+                num_deleted_ps += 1
+                continue
+
+            # Calculate ps_ratio based on the TARGET audio
+            ps_ratio = len(phoneme_ids) / (len(target_semantic_ids) / self.hz)
+            if ps_ratio > self.max_ps_ratio or ps_ratio < self.min_ps_ratio:
+                num_deleted_ps += 1
+                continue
+
+            ### NEW/MODIFIED ###
+            # Store the pair of semantics
+            self.semantic_phoneme.append((prompt_semantic_ids, target_semantic_ids, phoneme_ids))
+            self.item_names.append(item_name)
+            idx += 1
+
+        # ... (rest of the filtering and logging messages, can be updated to be more specific) ...
+        if num_not_in_phoneme > 0:
+            print(f"there are {num_not_in_phoneme} semantic datas not in phoneme datas")
+        if num_not_in_target > 0:
+            print(f"there are {num_not_in_target} prompt datas not in target datas")
+        if num_deleted_bigger > 0:
+            print(f"deleted {num_deleted_bigger} audios who's duration are bigger than {self.max_sec} seconds")
+        if num_deleted_ps > 0:
+            print(f"deleted {num_deleted_ps} audios who's phoneme/sec are bigger than {self.max_ps_ratio} or smaller than {self.min_ps_ratio}")
+        
+        # ... (logic for duplicating small datasets) ...
+        print("dataset.__len__():", self.__len__())
+
     def __get_item_names__(self) -> List[str]:
         return self.item_names
 
     def __len__(self) -> int:
         return len(self.semantic_phoneme)
 
-    def __getitem__(self, idx: int) -> Dict:
+    def __getitem___old(self, idx: int) -> Dict:
         semantic_ids, phoneme_ids = self.semantic_phoneme[idx]
         item_name = self.item_names[idx]
         phoneme_ids_len = len(phoneme_ids)
@@ -238,12 +339,42 @@ class Text2SemanticDataset(Dataset):
             "bert_feature": bert_feature,
         }
 
-    def get_sample_length(self, idx: int):
+    def __getitem__(self, idx: int) -> Dict:
+        ### NEW/MODIFIED ###
+        prompt_semantic_ids, target_semantic_ids, phoneme_ids = self.semantic_phoneme[idx]
+        item_name = self.item_names[idx]
+        
+        phoneme_ids_len = len(phoneme_ids)
+        prompt_semantic_ids_len = len(prompt_semantic_ids)
+        target_semantic_ids_len = len(target_semantic_ids)
+
+        bert_feature = None
+        path_bert = "%s/%s.pt" % (self.path3, item_name)
+        if os.path.exists(path_bert):
+            try:
+                bert_feature = torch.load(path_bert, map_location="cpu")
+                assert bert_feature.shape[-1] == len(phoneme_ids)
+            except Exception:
+                bert_feature = None
+
+        return {
+            "idx": idx,
+            "phoneme_ids": phoneme_ids,
+            "phoneme_ids_len": phoneme_ids_len,
+            ### NEW/MODIFIED ###
+            "prompt_semantic_ids": prompt_semantic_ids,
+            "prompt_semantic_ids_len": prompt_semantic_ids_len,
+            "target_semantic_ids": target_semantic_ids,
+            "target_semantic_ids_len": target_semantic_ids_len,
+            "bert_feature": bert_feature,
+        }
+
+    def get_sample_length_old(self, idx: int):
         semantic_ids = self.semantic_phoneme[idx][0]
         sec = 1.0 * len(semantic_ids) / self.hz
         return sec
 
-    def collate(self, examples: List[Dict]) -> Dict:
+    def collate_old(self, examples: List[Dict]) -> Dict:
         sample_index: List[int] = []
         phoneme_ids: List[torch.Tensor] = []
         phoneme_ids_lens: List[int] = []
@@ -290,6 +421,67 @@ class Text2SemanticDataset(Dataset):
             "bert_feature": bert_padded,
         }
 
+    def get_sample_length(self, idx: int):
+        # Length should be based on the TARGET audio, which is the second element
+        target_semantic_ids = self.semantic_phoneme[idx][1]
+        sec = 1.0 * len(target_semantic_ids) / self.hz
+        return sec
+
+    def collate(self, examples: List[Dict]) -> Dict:
+        sample_index: List[int] = []
+        phoneme_ids: List[torch.Tensor] = []
+        phoneme_ids_lens: List[int] = []
+        
+        ### NEW/MODIFIED ###
+        prompt_semantic_ids: List[torch.Tensor] = []
+        prompt_semantic_ids_lens: List[int] = []
+        target_semantic_ids: List[torch.Tensor] = []
+        target_semantic_ids_lens: List[int] = []
+
+        for item in examples:
+            sample_index.append(item["idx"])
+            phoneme_ids.append(np.array(item["phoneme_ids"], dtype=np.int64))
+            phoneme_ids_lens.append(item["phoneme_ids_len"])
+            
+            ### NEW/MODIFIED ###
+            prompt_semantic_ids.append(np.array(item["prompt_semantic_ids"], dtype=np.int64))
+            prompt_semantic_ids_lens.append(item["prompt_semantic_ids_len"])
+            target_semantic_ids.append(np.array(item["target_semantic_ids"], dtype=np.int64))
+            target_semantic_ids_lens.append(item["target_semantic_ids_len"])
+
+        phoneme_ids = batch_sequences(phoneme_ids)
+        ### NEW/MODIFIED ###
+        prompt_semantic_ids = batch_sequences(prompt_semantic_ids, pad_value=self.PAD)
+        target_semantic_ids = batch_sequences(target_semantic_ids, pad_value=self.PAD)
+
+        phoneme_ids = torch.tensor(phoneme_ids)
+        phoneme_ids_lens = torch.tensor(phoneme_ids_lens)
+        ### NEW/MODIFIED ###
+        prompt_semantic_ids = torch.tensor(prompt_semantic_ids)
+        prompt_semantic_ids_lens = torch.tensor(prompt_semantic_ids_lens)
+        target_semantic_ids = torch.tensor(target_semantic_ids)
+        target_semantic_ids_lens = torch.tensor(target_semantic_ids_lens)
+        
+        bert_padded = torch.FloatTensor(len(examples), 1024, max(phoneme_ids_lens))
+        bert_padded.zero_()
+
+        for idx, item in enumerate(examples):
+            bert = item["bert_feature"]
+            if bert is not None:
+                bert_padded[idx, :, : bert.shape[-1]] = bert
+
+        return {
+            "ids": sample_index,
+            "phoneme_ids": phoneme_ids,
+            "phoneme_ids_len": phoneme_ids_lens,
+            ### NEW/MODIFIED ###
+            # For the model, the 'prompt' is the input y, and 'target' is the ground truth
+            "prompt_y": prompt_semantic_ids,
+            "prompt_y_lens": prompt_semantic_ids_lens,
+            "target_y": target_semantic_ids,
+            "target_y_lens": target_semantic_ids_lens,
+            "bert_feature": bert_padded,
+        }
 
 if __name__ == "__main__":
     root_dir = "/data/docker/liujing04/gpt-vits/prepare/dump_mix/"

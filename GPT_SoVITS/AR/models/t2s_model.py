@@ -352,7 +352,142 @@ class Text2SemanticDecoder(nn.Module):
 
         self.t2s_transformer = T2STransformer(self.num_layers, blocks)
 
-    def make_input_data(self, x, x_lens, y, y_lens, bert_feature):
+    def make_input_data(
+        self, 
+        x, x_lens, 
+        prompt_y, prompt_y_lens,  # <-- NEW: Style A prompt
+        target_y, target_y_lens,  # <-- NEW: Style B target
+        bert_feature
+    ):
+        # --- 1. Embed Text and Prompt (The Context) ---
+        x_emb = self.ar_text_embedding(x)
+        x_emb = x_emb + self.bert_proj(bert_feature.transpose(1, 2))
+        x_emb = self.ar_text_position(x_emb)
+
+        prompt_emb = self.ar_audio_embedding(prompt_y)
+        # The prompt's position embedding starts after the text
+        prompt_pos = self.ar_audio_position(prompt_emb, past_kv_len=x.shape[1])
+        
+        # The full context is text + prompt
+        context = torch.cat([x_emb, prompt_pos], dim=1)
+        context_lens = x_lens + prompt_y_lens
+        context_len_max = context.shape[1]
+
+        # --- 2. Prepare Target Sequence (The one to be predicted) ---
+        # The target `y` is now the Style B semantics
+        target_y_mask = make_pad_mask_left(target_y_lens)
+        target_y_mask_int = target_y_mask.type(torch.int64)
+        codes = target_y.type(torch.int64) * (1 - target_y_mask_int)
+
+        # Use pad_y_eos to create the shifted input/target pair for Style B
+        y, targets_for_loss = self.pad_y_eos(codes, target_y_mask_int, eos_id=self.EOS)
+        
+        y_emb = self.ar_audio_embedding(y)
+        # The target's position embedding starts after the context
+        y_pos = self.ar_audio_position(y_emb, past_kv_len=context_len_max)
+        y_len_max = y_pos.shape[1]
+
+        # --- 3. Combine everything and create the final Attention Mask ---
+        # Final input sequence for the transformer
+        xy_pos = torch.cat([context, y_pos], dim=1)
+
+        # Create padding masks for each part
+        x_mask = make_pad_mask_left(x_lens)
+        prompt_mask = make_pad_mask_left(prompt_y_lens)
+        y_mask = make_pad_mask_left(y_lens) # Note: y_lens is for the *input* part of the target
+        
+        # Combined padding mask
+        xy_padding_mask = torch.cat([x_mask, prompt_mask, y_mask], dim=1)
+
+        # Create the attention mask
+        # It has shape (context_len_max + y_len_max, context_len_max + y_len_max)
+        # It controls what each token is allowed to see.
+        
+        # Context part: full attention on itself
+        context_attn_mask = F.pad(
+            torch.zeros((context_len_max, context_len_max), dtype=torch.bool, device=x.device),
+            (0, y_len_max),
+            value=True,
+        )
+        
+        # Target part: can see the full context, but is causal for itself
+        # This is a causal (triangular) mask for the target part
+        y_attn_mask_causal = torch.triu(
+            torch.ones(y_len_max, y_len_max, dtype=torch.bool, device=x.device),
+            diagonal=1,
+        )
+        # This part allows the target to see the context
+        y_attn_mask_context = torch.zeros((y_len_max, context_len_max), dtype=torch.bool, device=x.device)
+        # Combine them
+        y_attn_mask = torch.cat([y_attn_mask_context, y_attn_mask_causal], dim=1)
+        
+        # Final combined causal mask
+        xy_attn_mask = torch.cat([context_attn_mask, y_attn_mask], dim=0)
+
+        # Combine with padding mask
+        bsz, src_len = xy_pos.shape[0], xy_pos.shape[1]
+        _xy_padding_mask = (
+            xy_padding_mask.view(bsz, 1, 1, src_len)
+            .expand(-1, self.num_head, -1, -1)
+            .reshape(bsz * self.num_head, 1, src_len)
+        )
+        xy_attn_mask = xy_attn_mask.logical_or(_xy_padding_mask)
+        new_attn_mask = torch.zeros_like(xy_attn_mask, dtype=x.dtype)
+        new_attn_mask.masked_fill_(xy_attn_mask, float("-inf"))
+        xy_attn_mask = new_attn_mask
+
+        # Return the final input, the final mask, and the targets for the loss function
+        return xy_pos, xy_attn_mask, targets_for_loss, context_len_max
+
+    def forward(
+        self, 
+        x, x_lens,
+        prompt_y, prompt_y_lens,  # <-- NEW: Style A
+        target_y, target_y_lens,  # <-- NEW: Style B
+        bert_feature
+    ):
+        """
+        style transfer forward fn.
+        x: phoneme_ids
+        prompt_y: semantic_ids for Style A (the prompt)
+        target_y: semantic_ids for Style B (the generation target)
+        """
+        # For DPO, create a "bad" version of the target style (Style B)
+        reject_target_y, reject_target_y_lens = make_reject_y(target_y, target_y_lens)
+
+        # --- Process the good pair (A -> B) ---
+        xy_pos, xy_attn_mask, targets, context_len = self.make_input_data(
+            x, x_lens, prompt_y, prompt_y_lens, target_y, target_y_lens, bert_feature
+        )
+        xy_dec, _ = self.h(
+            (xy_pos, None),
+            mask=xy_attn_mask,
+        )
+        # We only care about the logits for the target (Style B) part of the sequence
+        logits = self.ar_predict_layer(xy_dec[:, context_len:])
+
+        # --- Process the bad pair (A -> reject B) for DPO ---
+        reject_xy_pos, reject_xy_attn_mask, reject_targets, _ = self.make_input_data(
+            x, x_lens, prompt_y, prompt_y_lens, reject_target_y, reject_target_y_lens, bert_feature
+        )
+        reject_xy_dec, _ = self.h(
+            (reject_xy_pos, None),
+            mask=reject_xy_attn_mask,
+        )
+        reject_logits = self.ar_predict_layer(reject_xy_dec[:, context_len:])
+
+        # --- Loss Calculation ---
+        loss_1 = F.cross_entropy(logits.permute(0, 2, 1), targets, reduction="sum")
+        acc = self.ar_accuracy_metric(logits.permute(0, 2, 1).detach(), targets).item()
+
+        A_logits, R_logits = get_batch_logps(logits, reject_logits, targets, reject_targets)
+        loss_2, _, _ = dpo_loss(A_logits, R_logits, 0, 0, 0.2, reference_free=True)
+
+        loss = loss_1 + loss_2
+
+        return loss, acc
+
+    def make_input_data_normal(self, x, x_lens, y, y_lens, bert_feature):
         x = self.ar_text_embedding(x)
         x = x + self.bert_proj(bert_feature.transpose(1, 2))
         x = self.ar_text_position(x)
@@ -405,7 +540,7 @@ class Text2SemanticDecoder(nn.Module):
 
         return xy_pos, xy_attn_mask, targets
 
-    def forward(self, x, x_lens, y, y_lens, bert_feature):
+    def forward_normal(self, x, x_lens, y, y_lens, bert_feature):
         """
         x: phoneme_ids
         y: semantic_ids
@@ -413,7 +548,7 @@ class Text2SemanticDecoder(nn.Module):
 
         reject_y, reject_y_lens = make_reject_y(y, y_lens)
 
-        xy_pos, xy_attn_mask, targets = self.make_input_data(x, x_lens, y, y_lens, bert_feature)
+        xy_pos, xy_attn_mask, targets = self.make_input_data_normal(x, x_lens, y, y_lens, bert_feature)
 
         xy_dec, _ = self.h(
             (xy_pos, None),

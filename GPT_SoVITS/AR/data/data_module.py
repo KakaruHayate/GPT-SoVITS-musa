@@ -13,6 +13,8 @@ class Text2SemanticDataModule(LightningDataModule):
         config,
         train_semantic_path,
         train_phoneme_path,
+        ### NEW/MODIFIED ###
+        train_pair_semantic_path=None, # Path for style transfer target
         dev_semantic_path=None,
         dev_phoneme_path=None,
     ):
@@ -22,6 +24,8 @@ class Text2SemanticDataModule(LightningDataModule):
         self.train_phoneme_path = train_phoneme_path
         self.dev_semantic_path = dev_semantic_path
         self.dev_phoneme_path = dev_phoneme_path
+        ### NEW/MODIFIED ###
+        self.train_pair_semantic_path = train_pair_semantic_path
         self.num_workers = self.config["data"]["num_workers"]
 
     def prepare_data(self):
@@ -31,6 +35,8 @@ class Text2SemanticDataModule(LightningDataModule):
         self._train_dataset = Text2SemanticDataset(
             phoneme_path=self.train_phoneme_path,
             semantic_path=self.train_semantic_path,
+            ### NEW/MODIFIED ###
+            pair_semantic_path=self.train_pair_semantic_path,
             max_sec=self.config["data"]["max_sec"],
             pad_val=self.config["data"]["pad_val"],
         )
