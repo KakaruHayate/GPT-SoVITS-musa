@@ -21,6 +21,8 @@ from AR.models.utils import (
 from AR.modules.embedding import SinePositionalEmbedding, TokenEmbedding
 from AR.modules.transformer import LayerNorm, TransformerEncoder, TransformerEncoderLayer
 
+# from icecream import ic
+
 default_config = {
     "embedding_dim": 512,
     "hidden_dim": 512,
@@ -361,6 +363,7 @@ class Text2SemanticDecoder(nn.Module):
     ):
         # --- 1. Embed Text and Prompt (The Context) ---
         x_emb = self.ar_text_embedding(x)
+        x_new = x_emb
         x_emb = x_emb + self.bert_proj(bert_feature.transpose(1, 2))
         x_emb = self.ar_text_position(x_emb)
 
@@ -394,7 +397,7 @@ class Text2SemanticDecoder(nn.Module):
         # Create padding masks for each part
         x_mask = make_pad_mask_left(x_lens)
         prompt_mask = make_pad_mask_left(prompt_y_lens)
-        y_mask = make_pad_mask_left(y_lens) # Note: y_lens is for the *input* part of the target
+        y_mask = make_pad_mask_left(target_y_lens) # Note: y_lens is for the *input* part of the target
         
         # Combined padding mask
         xy_padding_mask = torch.cat([x_mask, prompt_mask, y_mask], dim=1)
@@ -432,7 +435,7 @@ class Text2SemanticDecoder(nn.Module):
             .reshape(bsz * self.num_head, 1, src_len)
         )
         xy_attn_mask = xy_attn_mask.logical_or(_xy_padding_mask)
-        new_attn_mask = torch.zeros_like(xy_attn_mask, dtype=x.dtype)
+        new_attn_mask = torch.zeros_like(xy_attn_mask, dtype=x_new.dtype)
         new_attn_mask.masked_fill_(xy_attn_mask, float("-inf"))
         xy_attn_mask = new_attn_mask
 
@@ -440,6 +443,35 @@ class Text2SemanticDecoder(nn.Module):
         return xy_pos, xy_attn_mask, targets_for_loss, context_len_max
 
     def forward(
+        self, 
+        x, x_lens,
+        prompt_y, prompt_y_lens,
+        target_y, target_y_lens,
+        bert_feature
+    ):
+        """
+        style transfer forward fn.
+        x: phoneme_ids
+        prompt_y: semantic_ids for Style A (the prompt)
+        target_y: semantic_ids for Style B (the generation target)
+        """
+        xy_pos, xy_attn_mask, targets, context_len = self.make_input_data(
+            x, x_lens, prompt_y, prompt_y_lens, target_y, target_y_lens, bert_feature
+        )
+        
+        xy_dec, _ = self.h(
+            (xy_pos, None),
+            mask=xy_attn_mask,
+        )
+        
+        logits = self.ar_predict_layer(xy_dec[:, context_len-1:])
+
+        loss = F.cross_entropy(logits.permute(0, 2, 1), targets, reduction="sum")
+        acc = self.ar_accuracy_metric(logits.permute(0, 2, 1).detach(), targets).item()
+
+        return loss, acc
+
+    def forward_dpo(
         self, 
         x, x_lens,
         prompt_y, prompt_y_lens,  # <-- NEW: Style A
@@ -464,7 +496,11 @@ class Text2SemanticDecoder(nn.Module):
             mask=xy_attn_mask,
         )
         # We only care about the logits for the target (Style B) part of the sequence
-        logits = self.ar_predict_layer(xy_dec[:, context_len:])
+        logits = self.ar_predict_layer(xy_dec[:, context_len-1:])
+
+        # ic(target.shape)
+        # ic(logits.shape)
+        # ic(context_len)
 
         # --- Process the bad pair (A -> reject B) for DPO ---
         reject_xy_pos, reject_xy_attn_mask, reject_targets, _ = self.make_input_data(
@@ -474,7 +510,7 @@ class Text2SemanticDecoder(nn.Module):
             (reject_xy_pos, None),
             mask=reject_xy_attn_mask,
         )
-        reject_logits = self.ar_predict_layer(reject_xy_dec[:, context_len:])
+        reject_logits = self.ar_predict_layer(reject_xy_dec[:, context_len-1:])
 
         # --- Loss Calculation ---
         loss_1 = F.cross_entropy(logits.permute(0, 2, 1), targets, reduction="sum")
