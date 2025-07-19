@@ -129,10 +129,32 @@ def main(args):
 
     model: Text2SemanticLightningModule = Text2SemanticLightningModule(config, output_dir)
 
+    ### NEW/MODIFIED - Automatic detection of style transfer mode ###
+    train_semantic_path = config["train_semantic_path"]
+    
+    # Construct the potential path for the paired semantic file
+    p = Path(train_semantic_path)
+    # The new file name will be 'pair_' + original_filename
+    train_pair_semantic_path = p.with_name(f"pair_{p.name}")
+
+    # Check if the paired file exists
+    if not train_pair_semantic_path.is_file():
+        # If it doesn't exist, set it to None to trigger normal (cloning) mode
+        print(f"Paired semantic file not found at '{train_pair_semantic_path}'. Running in normal (cloning) mode.")
+        train_pair_semantic_path = None
+    else:
+        # If it exists, use it for style transfer
+        print(f"Paired semantic file found at '{train_pair_semantic_path}'. Running in STYLE TRANSFER mode.")
+        # Convert path object back to string for DataModule
+        train_pair_semantic_path = str(train_pair_semantic_path)
+    ### END OF NEW/MODIFIED ###
+
     data_module: Text2SemanticDataModule = Text2SemanticDataModule(
         config,
-        train_semantic_path=config["train_semantic_path"],
+        train_semantic_path=train_semantic_path,
         train_phoneme_path=config["train_phoneme_path"],
+        ### NEW/MODIFIED ###
+        train_pair_semantic_path=train_pair_semantic_path,
         # dev_semantic_path=args.dev_semantic_path,
         # dev_phoneme_path=args.dev_phoneme_path
     )
